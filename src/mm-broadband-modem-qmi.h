@@ -46,4 +46,5 @@ MMBroadbandModemQmi *mm_broadband_modem_qmi_new (const gchar *device,
                                                  guint16 vendor_id,
                                                  guint16 product_id);
 
+
 #endif /* MM_BROADBAND_MODEM_QMI_H */

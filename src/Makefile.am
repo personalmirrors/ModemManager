@@ -374,6 +374,9 @@ ModemManager_SOURCES += \
 	mm-bearer-qmi.c \
 	mm-broadband-modem-qmi.h \
 	mm-broadband-modem-qmi.c \
+	mm-broadband-modem-qmi-private.h \
+	mm-broadband-modem-qmi-location.h \
+	mm-broadband-modem-qmi-location-pds.c \
 	$(NULL)
 endif
 
