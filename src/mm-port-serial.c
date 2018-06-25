@@ -1152,6 +1152,16 @@ mm_port_serial_open (MMPortSerial *self, GError **error)
 
     /* Serial port specific setup */
     if (mm_port_get_subsys (MM_PORT (self)) == MM_PORT_SUBSYS_TTY) {
+        /* Check the serial device for locking */
+        int locking_status = 0;
+
+        if (ioctl (self->priv->fd, TIOCGEXCL, &locking_status) == 0 && locking_status != 0) {
+            g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_OPEN_FAILED,
+                         "Serial device %s is already locked", device);
+            mm_warn ("(%s) serial device is already locked", device);
+            goto error;
+        }
+
         /* Try to lock serial device */
         if (ioctl (self->priv->fd, TIOCEXCL) < 0) {
             errno_save = errno;
