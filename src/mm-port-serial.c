@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <string.h>
 #include <linux/serial.h>
 
@@ -1069,7 +1070,9 @@ port_connected (MMPortSerial *self, GParamSpec *pspec, gpointer user_data)
      */
     connected = mm_port_get_connected (MM_PORT (self));
 
-    if (self->priv->fd >= 0 && ioctl (self->priv->fd, (connected ? TIOCNXCL : TIOCEXCL)) < 0) {
+    if (self->priv->fd >= 0 && (
+        ioctl (self->priv->fd, (connected ? TIOCNXCL : TIOCEXCL)) < 0 ||
+        flock (self->priv->fd, (connected ? LOCK_UN : LOCK_EX) | LOCK_NB) < 0)) {
         mm_warn ("(%s): could not %s serial port lock: (%d) %s",
                  mm_port_get_device (MM_PORT (self)),
                  connected ? "drop" : "re-acquire",
@@ -1152,22 +1155,35 @@ mm_port_serial_open (MMPortSerial *self, GError **error)
 
     /* Serial port specific setup */
     if (mm_port_get_subsys (MM_PORT (self)) == MM_PORT_SUBSYS_TTY) {
-        /* Check the serial device for locking */
+        /* There are two APIs providing a general lock mechanism for
+         * serial devices on linux, tty_ioctl(4) and flock(2). For wider
+         * compatibility, both are implemented. */
+
+        /* Check the serial device for locking, using tty_ioctl(4) */
         int locking_status = 0;
 
         if (ioctl (self->priv->fd, TIOCGEXCL, &locking_status) == 0 && locking_status != 0) {
             g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_OPEN_FAILED,
-                         "Serial device %s is already locked", device);
-            mm_warn ("(%s) serial device is already locked", device);
+                         "Serial device %s is already locked using tty_ioctl(4)", device);
+            mm_warn ("(%s) serial device is already locked using tty_ioctl(4)", device);
             goto error;
         }
 
-        /* Try to lock serial device */
+        /* Try to lock serial device, using tty_ioctl(4) */
         if (ioctl (self->priv->fd, TIOCEXCL) < 0) {
             errno_save = errno;
             g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_OPEN_FAILED,
-                         "Could not lock serial device %s: %s", device, strerror (errno_save));
-            mm_warn ("(%s) could not lock serial device (%d)", device, errno_save);
+                         "Could not lock serial device using tty_ioctl(4) %s: %s", device, strerror (errno_save));
+            mm_warn ("(%s) could not lock serial device using tty_ioctl(4) (%d)", device, errno_save);
+            goto error;
+        }
+
+        /* Try to lock serial device, and check it for locking, using flock(2) */
+        if (flock (self->priv->fd, LOCK_EX | LOCK_NB) < 0) {
+            errno_save = errno;
+            g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_OPEN_FAILED,
+                         "Could not lock serial device %s using flock(2): %s", device, strerror (errno_save));
+            mm_warn ("(%s) could not lock serial device using flock(2) (%d)", device, errno_save);
             goto error;
         }
 
