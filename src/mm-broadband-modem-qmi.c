@@ -39,6 +39,7 @@
 #include "mm-iface-modem-firmware.h"
 #include "mm-iface-modem-signal.h"
 #include "mm-iface-modem-oma.h"
+#include "mm-shared-qmi.h"
 #include "mm-sim-qmi.h"
 #include "mm-bearer-qmi.h"
 #include "mm-sms-qmi.h"
@@ -54,6 +55,7 @@ static void iface_modem_location_init (MMIfaceModemLocation *iface);
 static void iface_modem_oma_init (MMIfaceModemOma *iface);
 static void iface_modem_firmware_init (MMIfaceModemFirmware *iface);
 static void iface_modem_signal_init (MMIfaceModemSignal *iface);
+static void shared_qmi_init (MMSharedQmi *iface);
 
 static MMIfaceModemMessaging *iface_modem_messaging_parent;
 static MMIfaceModemLocation *iface_modem_location_parent;
@@ -67,7 +69,8 @@ G_DEFINE_TYPE_EXTENDED (MMBroadbandModemQmi, mm_broadband_modem_qmi, MM_TYPE_BRO
                         G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_LOCATION, iface_modem_location_init)
                         G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_SIGNAL, iface_modem_signal_init)
                         G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_OMA, iface_modem_oma_init)
-                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_FIRMWARE, iface_modem_firmware_init))
+                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_FIRMWARE, iface_modem_firmware_init)
+                        G_IMPLEMENT_INTERFACE (MM_TYPE_SHARED_QMI, shared_qmi_init))
 
 struct _MMBroadbandModemQmiPrivate {
     /* Cached device IDs, retrieved by the modem interface when loading device
@@ -134,9 +137,10 @@ struct _MMBroadbandModemQmiPrivate {
 /*****************************************************************************/
 
 static QmiClient *
-peek_qmi_client (MMBroadbandModemQmi *self,
-                 QmiService service,
-                 GError **error)
+shared_qmi_peek_client (MMSharedQmi    *self,
+                        QmiService      service,
+                        MMPortQmiFlag   flag,
+                        GError        **error)
 {
     MMPortQmi *port;
     QmiClient *client;
@@ -150,9 +154,7 @@ peek_qmi_client (MMBroadbandModemQmi *self,
         return NULL;
     }
 
-    client = mm_port_qmi_peek_client (port,
-                                      service,
-                                      MM_PORT_QMI_FLAG_DEFAULT);
+    client = mm_port_qmi_peek_client (port, service, flag);
     if (!client)
         g_set_error (error,
                      MM_CORE_ERROR,
@@ -173,7 +175,7 @@ ensure_qmi_client (MMBroadbandModemQmi *self,
     GError *error = NULL;
     QmiClient *client;
 
-    client = peek_qmi_client (self, service, &error);
+    client = shared_qmi_peek_client (MM_SHARED_QMI (self), service, MM_PORT_QMI_FLAG_DEFAULT, &error);
     if (!client) {
         g_task_report_error (self, callback, user_data, ensure_qmi_client, error);
         return FALSE;
@@ -1766,7 +1768,7 @@ load_unlock_required_context_step (GTask *task)
     case LOAD_UNLOCK_REQUIRED_STEP_DMS:
         if (!self->priv->dms_uim_deprecated) {
             /* Failure to get DMS client is hard really */
-            client = peek_qmi_client (self, QMI_SERVICE_DMS, &error);
+            client = shared_qmi_peek_client (MM_SHARED_QMI (self), QMI_SERVICE_DMS, MM_PORT_QMI_FLAG_DEFAULT, &error);
             if (!client) {
                 g_task_return_error (task, error);
                 g_object_unref (task);
@@ -1787,7 +1789,7 @@ load_unlock_required_context_step (GTask *task)
 
     case LOAD_UNLOCK_REQUIRED_STEP_UIM:
         /* Failure to get UIM client at this point is hard as well */
-        client = peek_qmi_client (self, QMI_SERVICE_UIM, &error);
+        client = shared_qmi_peek_client (MM_SHARED_QMI (self), QMI_SERVICE_UIM, MM_PORT_QMI_FLAG_DEFAULT, &error);
         if (!client) {
             g_task_return_error (task, error);
             g_object_unref (task);
@@ -1883,7 +1885,7 @@ uim_load_unlock_retries (MMBroadbandModemQmi *self,
     QmiClient *client;
     GError *error = NULL;
 
-    client = peek_qmi_client (self, QMI_SERVICE_UIM, &error);
+    client = shared_qmi_peek_client (MM_SHARED_QMI (self), QMI_SERVICE_UIM, MM_PORT_QMI_FLAG_DEFAULT, &error);
     if (!client) {
         g_task_return_error (task, error);
         g_object_unref (task);
@@ -1972,7 +1974,7 @@ dms_uim_load_unlock_retries (MMBroadbandModemQmi *self,
 {
     QmiClient *client;
 
-    client = peek_qmi_client (self, QMI_SERVICE_DMS, NULL);
+    client = shared_qmi_peek_client (MM_SHARED_QMI (self), QMI_SERVICE_DMS, MM_PORT_QMI_FLAG_DEFAULT, NULL);
     if (!client) {
         /* Very unlikely that this will ever happen, but anyway, try with
          * UIM service instead */
@@ -2016,7 +2018,7 @@ modem_load_supported_bands_finish (MMIfaceModem *_self,
 {
     MMBroadbandModemQmi *self = MM_BROADBAND_MODEM_QMI (_self);
     GArray *supported_bands;
-    
+
     supported_bands = g_task_propagate_pointer (G_TASK (res), error);
     if (supported_bands) {
         if (self->priv->supported_bands)
@@ -7029,13 +7031,11 @@ messaging_check_support (MMIfaceModemMessaging *self,
                          gpointer user_data)
 {
     GTask *task;
-    MMPortQmi *port;
 
     task = g_task_new (self, NULL, callback, user_data);
 
-    port = mm_base_modem_peek_port_qmi (MM_BASE_MODEM (self));
     /* If we have support for the WMS client, messaging is supported */
-    if (!port || !mm_port_qmi_peek_client (port, QMI_SERVICE_WMS, MM_PORT_QMI_FLAG_DEFAULT)) {
+    if (!shared_qmi_peek_client (MM_SHARED_QMI (self), QMI_SERVICE_WMS, MM_PORT_QMI_FLAG_DEFAULT, NULL)) {
         /* Try to fallback to AT support */
         iface_modem_messaging_parent->check_support (
             self,
@@ -8059,78 +8059,6 @@ messaging_create_sms (MMIfaceModemMessaging *_self)
 }
 
 /*****************************************************************************/
-/* Location capabilities loading (Location interface) */
-
-static MMModemLocationSource
-location_load_capabilities_finish (MMIfaceModemLocation *self,
-                                   GAsyncResult *res,
-                                   GError **error)
-{
-    GError *inner_error = NULL;
-    gssize value;
-
-    value = g_task_propagate_int (G_TASK (res), &inner_error);
-    if (inner_error) {
-        g_propagate_error (error, inner_error);
-        return MM_MODEM_LOCATION_SOURCE_NONE;
-    }
-    return (MMModemLocationSource)value;
-}
-
-static void
-parent_load_capabilities_ready (MMIfaceModemLocation *self,
-                                GAsyncResult *res,
-                                GTask *task)
-{
-    MMModemLocationSource sources;
-    GError *error = NULL;
-    MMPortQmi *port;
-
-    sources = iface_modem_location_parent->load_capabilities_finish (self, res, &error);
-    if (error) {
-        g_task_return_error (task, error);
-        g_object_unref (task);
-        return;
-    }
-
-    port = mm_base_modem_peek_port_qmi (MM_BASE_MODEM (self));
-
-    /* Now our own checks */
-
-    /* If we have support for the PDS client, GPS and A-GPS location is supported */
-    if (port && mm_port_qmi_peek_client (port,
-                                         QMI_SERVICE_PDS,
-                                         MM_PORT_QMI_FLAG_DEFAULT))
-        sources |= (MM_MODEM_LOCATION_SOURCE_GPS_NMEA |
-                    MM_MODEM_LOCATION_SOURCE_GPS_RAW |
-                    MM_MODEM_LOCATION_SOURCE_AGPS);
-
-    /* If the modem is CDMA, we have support for CDMA BS location */
-    if (mm_iface_modem_is_cdma (MM_IFACE_MODEM (self)))
-        sources |= MM_MODEM_LOCATION_SOURCE_CDMA_BS;
-
-    /* So we're done, complete */
-    g_task_return_int (task, sources);
-    g_object_unref (task);
-}
-
-static void
-location_load_capabilities (MMIfaceModemLocation *self,
-                            GAsyncReadyCallback callback,
-                            gpointer user_data)
-{
-    GTask *task;
-
-    task = g_task_new (self, NULL, callback, user_data);
-
-    /* Chain up parent's setup */
-    iface_modem_location_parent->load_capabilities (
-        self,
-        (GAsyncReadyCallback)parent_load_capabilities_ready,
-        task);
-}
-
-/*****************************************************************************/
 /* Load SUPL server */
 
 static gchar *
@@ -8981,7 +8909,7 @@ parent_enable_location_gathering_ready (MMIfaceModemLocation *_self,
     }
 
     /* Setup context and client */
-    client = peek_qmi_client (self, QMI_SERVICE_PDS, &error);
+    client = shared_qmi_peek_client (MM_SHARED_QMI (self), QMI_SERVICE_PDS, MM_PORT_QMI_FLAG_DEFAULT, &error);
     if (!client) {
         g_task_return_error (task, error);
         g_object_unref (task);
@@ -9075,13 +9003,11 @@ oma_check_support (MMIfaceModemOma *self,
                    gpointer user_data)
 {
     GTask *task;
-    MMPortQmi *port;
 
     task = g_task_new (self, NULL, callback, user_data);
 
-    port = mm_base_modem_peek_port_qmi (MM_BASE_MODEM (self));
     /* If we have support for the OMA client, OMA is supported */
-    if (!port || !mm_port_qmi_peek_client (port, QMI_SERVICE_OMA, MM_PORT_QMI_FLAG_DEFAULT)) {
+    if (!shared_qmi_peek_client (MM_SHARED_QMI (self), QMI_SERVICE_OMA, MM_PORT_QMI_FLAG_DEFAULT, NULL)) {
         mm_dbg ("OMA capabilities not supported");
         g_task_return_boolean (task, FALSE);
     } else {
@@ -10346,20 +10272,19 @@ signal_check_support (MMIfaceModemSignal *self,
                       GAsyncReadyCallback callback,
                       gpointer user_data)
 {
-    MMPortQmi *port;
-    gboolean supported = FALSE;
     GTask *task;
 
-    port = mm_base_modem_peek_port_qmi (MM_BASE_MODEM (self));
+    task = g_task_new (self, NULL, callback, user_data);
 
     /* If NAS service is available, assume either signal info or signal strength are supported */
-    if (port)
-        supported = !!mm_port_qmi_peek_client (port, QMI_SERVICE_NAS, MM_PORT_QMI_FLAG_DEFAULT);
-
-    mm_dbg ("Extended signal capabilities %ssupported", supported ? "" : "not ");
-
-    task = g_task_new (self, NULL, callback, user_data);
-    g_task_return_boolean (task, supported);
+    /* If we have support for the OMA client, OMA is supported */
+    if (!shared_qmi_peek_client (MM_SHARED_QMI (self), QMI_SERVICE_NAS, MM_PORT_QMI_FLAG_DEFAULT, NULL)) {
+        mm_dbg ("Extended signal capabilities not supported");
+        g_task_return_boolean (task, FALSE);
+    } else {
+        mm_dbg ("Extended signal capabilities supported");
+        g_task_return_boolean (task, TRUE);
+    }
     g_object_unref (task);
 }
 
@@ -11359,8 +11284,8 @@ iface_modem_location_init (MMIfaceModemLocation *iface)
 {
     iface_modem_location_parent = g_type_interface_peek_parent (iface);
 
-    iface->load_capabilities = location_load_capabilities;
-    iface->load_capabilities_finish = location_load_capabilities_finish;
+    iface->load_capabilities = mm_shared_qmi_location_load_capabilities;
+    iface->load_capabilities_finish = mm_shared_qmi_location_load_capabilities_finish;
     iface->load_supl_server = location_load_supl_server;
     iface->load_supl_server_finish = location_load_supl_server_finish;
     iface->set_supl_server = location_set_supl_server;
@@ -11416,6 +11341,12 @@ iface_modem_firmware_init (MMIfaceModemFirmware *iface)
     iface->load_current_finish = firmware_load_current_finish;
     iface->change_current = firmware_change_current;
     iface->change_current_finish = firmware_change_current_finish;
+}
+
+static void
+shared_qmi_init (MMSharedQmi *iface)
+{
+    iface->peek_client = shared_qmi_peek_client;
 }
 
 static void
