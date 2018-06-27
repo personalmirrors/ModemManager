@@ -1159,10 +1159,23 @@ mm_port_serial_open (MMPortSerial *self, GError **error)
          * serial devices on linux, tty_ioctl(4) and flock(2). For wider
          * compatibility, both are implemented. */
 
-        /* Check the serial device for locking, using tty_ioctl(4) */
+        /* Check the serial device for locking, using tty_ioctl(4) - needed
+         * because the tty_ioctl(4) lock will cause the open(2) call to fail
+         * only for non-root processes, which ModemManager generally isn't.
+         *
+         * This check is possible only with Linux >= 3.8, hence EINVAL or
+         * ENOTTY (nonexistent ioctl) are accepted */
         int locking_status = 0;
 
-        if (ioctl (self->priv->fd, TIOCGEXCL, &locking_status) == 0 && locking_status != 0) {
+        if (ioctl (self->priv->fd, TIOCGEXCL, &locking_status) < 0 && errno != EINVAL && errno != ENOTTY) {
+            errno_save = errno;
+            g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_OPEN_FAILED,
+                         "Could not check serial device locking status using tty_ioctl(4) %s: %s", device, g_strerror (errno_save));
+            mm_warn ("(%s) could not check serial device locking status using tty_ioctl(4) (%d)", device, errno_save);
+            goto error;
+        }
+
+        if (locking_status != 0) {
             g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_OPEN_FAILED,
                          "Serial device %s is already locked using tty_ioctl(4)", device);
             mm_warn ("(%s) serial device is already locked using tty_ioctl(4)", device);
