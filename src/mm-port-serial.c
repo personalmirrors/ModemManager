@@ -554,7 +554,7 @@ port_serial_process_command (MMPortSerial *self,
                 g_signal_emit (self, signals[TIMED_OUT], 0, self->priv->n_consecutive_timeouts);
 
                 g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_SEND_FAILED,
-                             "Sending command failed: '%s'", strerror (errno));
+                             "Sending command failed: '%s'", g_strerror (errno));
                 return FALSE;
             }
             break;
@@ -586,7 +586,7 @@ port_serial_process_command (MMPortSerial *self,
                 self->priv->n_consecutive_timeouts++;
                 g_signal_emit (self, signals[TIMED_OUT], 0, self->priv->n_consecutive_timeouts);
                 g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_SEND_FAILED,
-                             "Sending command failed: '%s'", strerror (errno));
+                             "Sending command failed: '%s'", g_strerror (errno));
                 return FALSE;
             }
 
@@ -1077,7 +1077,7 @@ port_connected (MMPortSerial *self, GParamSpec *pspec, gpointer user_data)
                  mm_port_get_device (MM_PORT (self)),
                  connected ? "drop" : "re-acquire",
                  errno,
-                 strerror (errno));
+                 g_strerror (errno));
         if (!connected) {
             // FIXME: do something here, maybe try again in a few seconds or
             // close the port and error out?
@@ -1147,7 +1147,7 @@ mm_port_serial_open (MMPortSerial *self, GError **error)
             g_set_error (error,
                          MM_SERIAL_ERROR,
                          (errno == ENODEV) ? MM_SERIAL_ERROR_OPEN_FAILED_NO_DEVICE : MM_SERIAL_ERROR_OPEN_FAILED,
-                         "Could not open serial device %s: %s", device, strerror (errno_save));
+                         "Could not open serial device %s: %s", device, g_strerror (errno_save));
             mm_warn ("(%s) could not open serial device (%d)", device, errno_save);
             return FALSE;
         }
@@ -1173,7 +1173,7 @@ mm_port_serial_open (MMPortSerial *self, GError **error)
         if (ioctl (self->priv->fd, TIOCEXCL) < 0) {
             errno_save = errno;
             g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_OPEN_FAILED,
-                         "Could not lock serial device using tty_ioctl(4) %s: %s", device, strerror (errno_save));
+                         "Could not lock serial device using tty_ioctl(4) %s: %s", device, g_strerror (errno_save));
             mm_warn ("(%s) could not lock serial device using tty_ioctl(4) (%d)", device, errno_save);
             goto error;
         }
@@ -1182,7 +1182,7 @@ mm_port_serial_open (MMPortSerial *self, GError **error)
         if (flock (self->priv->fd, LOCK_EX | LOCK_NB) < 0) {
             errno_save = errno;
             g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_OPEN_FAILED,
-                         "Could not lock serial device %s using flock(2): %s", device, strerror (errno_save));
+                         "Could not lock serial device %s using flock(2): %s", device, g_strerror (errno_save));
             mm_warn ("(%s) could not lock serial device using flock(2) (%d)", device, errno_save);
             goto error;
         }
