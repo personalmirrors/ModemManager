@@ -1059,33 +1059,52 @@ data_watch_enable (MMPortSerial *self, gboolean enable)
 static void
 port_connected (MMPortSerial *self, GParamSpec *pspec, gpointer user_data)
 {
-    gboolean connected;
+    gboolean connected = mm_port_get_connected (MM_PORT (self));
+    int errno_save = 0;
 
     if (!self->priv->iochannel && !self->priv->socket)
         return;
 
-    /* When the port is connected, drop the serial port lock so PPP can do
-     * something with the port.  When the port is disconnected, grab the lock
-     * again.
-     */
-    connected = mm_port_get_connected (MM_PORT (self));
+    /* Serial port specific setup */
+    if (self->priv->fd >= 0 && mm_port_get_subsys (MM_PORT (self)) == MM_PORT_SUBSYS_TTY) {
 
-    if (self->priv->fd >= 0 && (
-        ioctl (self->priv->fd, (connected ? TIOCNXCL : TIOCEXCL)) < 0 ||
-        flock (self->priv->fd, (connected ? LOCK_UN : LOCK_EX) | LOCK_NB) < 0)) {
-        mm_warn ("(%s): could not %s serial port lock: (%d) %s",
-                 mm_port_get_device (MM_PORT (self)),
-                 connected ? "drop" : "re-acquire",
-                 errno,
-                 g_strerror (errno));
-        if (!connected) {
-            // FIXME: do something here, maybe try again in a few seconds or
-            // close the port and error out?
+        /* When the port is connected, drop the serial port lock so PPP can do
+         * something with the port.  When the port is disconnected, grab the lock
+         * again.
+         */
+
+        if (ioctl (self->priv->fd, (connected ? TIOCNXCL : TIOCEXCL)) < 0) {
+            errno_save = errno;
+            mm_warn ("(%s): could not %s the tty_ioctl(4) serial port lock: (%d) %s",
+                     mm_port_get_device (MM_PORT (self)),
+                     connected ? "drop" : "re-acquire",
+                     errno_save,
+                     g_strerror (errno_save));
+            goto error;
         }
+
+        if (flock (self->priv->fd, (connected ? LOCK_UN : LOCK_EX) | LOCK_NB) < 0) {
+            errno_save = errno;
+            mm_warn ("(%s): could not %s the flock(2) serial port lock: (%d) %s",
+                     mm_port_get_device (MM_PORT (self)),
+                     connected ? "drop" : "re-acquire",
+                     errno_save,
+                     g_strerror (errno_save));
+            goto error;
+        }
+
     }
 
     /* When connected ignore let PPP have all the data */
     data_watch_enable (self, !connected);
+
+    return;
+
+error:
+    if (!connected) {
+        // FIXME: do something here, maybe try again in a few seconds or
+        // close the port and error out?
+    }
 }
 
 gboolean
