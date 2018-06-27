@@ -1172,14 +1172,14 @@ mm_port_serial_open (MMPortSerial *self, GError **error)
             g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_OPEN_FAILED,
                          "Could not check serial device locking status using tty_ioctl(4) %s: %s", device, g_strerror (errno_save));
             mm_warn ("(%s) could not check serial device locking status using tty_ioctl(4) (%d)", device, errno_save);
-            goto error;
+            goto error_before_locking_port;
         }
 
         if (locking_status != 0) {
             g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_OPEN_FAILED,
                          "Serial device %s is already locked using tty_ioctl(4)", device);
             mm_warn ("(%s) serial device is already locked using tty_ioctl(4)", device);
-            goto error;
+            goto error_before_locking_port;
         }
 
         /* Try to lock serial device, using tty_ioctl(4) */
@@ -1188,7 +1188,7 @@ mm_port_serial_open (MMPortSerial *self, GError **error)
             g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_OPEN_FAILED,
                          "Could not lock serial device using tty_ioctl(4) %s: %s", device, g_strerror (errno_save));
             mm_warn ("(%s) could not lock serial device using tty_ioctl(4) (%d)", device, errno_save);
-            goto error;
+            goto error_before_locking_port;
         }
 
         /* Try to lock serial device, and check it for locking, using flock(2) */
@@ -1197,6 +1197,7 @@ mm_port_serial_open (MMPortSerial *self, GError **error)
             g_set_error (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_OPEN_FAILED,
                          "Could not lock serial device %s using flock(2): %s", device, g_strerror (errno_save));
             mm_warn ("(%s) could not lock serial device using flock(2) (%d)", device, errno_save);
+
             goto error;
         }
 
@@ -1299,6 +1300,13 @@ success:
     return TRUE;
 
 error:
+    /* Remove the tty_ioctl(4) lock, when set */
+    if (ioctl (self->priv->fd, TIOCNXCL) < 0) {
+        errno_save = errno;
+        mm_warn ("(%s) could not unlock serial device using tty_ioctl(4) (%d)", device, errno_save);
+    }
+
+error_before_locking_port:
     mm_warn ("(%s) failed to open serial device", device);
 
     if (self->priv->iochannel) {
@@ -1334,6 +1342,7 @@ _close_internal (MMPortSerial *self, gboolean force)
 {
     const char *device;
     int i;
+    int errno_save = 0;
 
     g_return_if_fail (MM_IS_PORT_SERIAL (self));
 
@@ -1384,6 +1393,12 @@ _close_internal (MMPortSerial *self, gboolean force)
             }
 
             tcflush (self->priv->fd, TCIOFLUSH);
+
+            /* Remove the possibly set tty_ioctl(4) lock */
+            if (ioctl (self->priv->fd, TIOCNXCL) < 0) {
+                errno_save = errno;
+                mm_warn ("(%s) could not unlock serial device using tty_ioctl(4) (%d)", device, errno_save);
+            }
         }
 
         /* Destroy channel */
