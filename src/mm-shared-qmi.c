@@ -29,6 +29,9 @@
 #include "mm-iface-modem-location.h"
 #include "mm-shared-qmi.h"
 
+/* Default session id to use in LOC operations */
+#define DEFAULT_LOC_SESSION_ID 0x10
+
 /*****************************************************************************/
 /* Private data context */
 
@@ -39,16 +42,22 @@ typedef struct {
     /* Location helpers */
     MMModemLocationSource  enabled_sources;
     QmiClient             *pds_client;
-    guint                  location_event_report_indication_id;
+    guint                  pds_location_event_report_indication_id;
+    QmiClient             *loc_client;
+    guint                  loc_location_nmea_indication_id;
 } Private;
 
 static void
 private_free (Private *priv)
 {
-    if (priv->location_event_report_indication_id)
-        g_signal_handler_disconnect (priv->pds_client, priv->location_event_report_indication_id);
+    if (priv->pds_location_event_report_indication_id)
+        g_signal_handler_disconnect (priv->pds_client, priv->pds_location_event_report_indication_id);
     if (priv->pds_client)
         g_object_unref (priv->pds_client);
+    if (priv->loc_location_nmea_indication_id)
+        g_signal_handler_disconnect (priv->loc_client, priv->loc_location_nmea_indication_id);
+    if (priv->loc_client)
+        g_object_unref (priv->loc_client);
     g_slice_free (Private, priv);
 }
 
@@ -308,7 +317,7 @@ mm_shared_qmi_location_load_supl_server (MMIfaceModemLocation *self,
 /* Location: disable */
 
 typedef struct {
-    QmiClientPds          *client;
+    QmiClient             *client;
     MMModemLocationSource  source;
 } DisableLocationGatheringContext;
 
@@ -329,9 +338,9 @@ mm_shared_qmi_disable_location_gathering_finish (MMIfaceModemLocation  *self,
 }
 
 static void
-gps_service_state_stop_ready (QmiClientPds *client,
-                              GAsyncResult *res,
-                              GTask        *task)
+pds_gps_service_state_stop_ready (QmiClientPds *client,
+                                  GAsyncResult *res,
+                                  GTask        *task)
 {
     MMSharedQmi                           *self;
     Private                               *priv;
@@ -367,11 +376,11 @@ gps_service_state_stop_ready (QmiClientPds *client,
     priv = get_private (self);
     ctx  = g_task_get_task_data (task);
 
-    g_assert (priv->location_event_report_indication_id != 0);
+    g_assert (priv->pds_location_event_report_indication_id != 0);
     g_assert (priv->pds_client);
 
-    g_signal_handler_disconnect (priv->pds_client, priv->location_event_report_indication_id);
-    priv->location_event_report_indication_id = 0;
+    g_signal_handler_disconnect (priv->pds_client, priv->pds_location_event_report_indication_id);
+    priv->pds_location_event_report_indication_id = 0;
     g_clear_object (&priv->pds_client);
 
     mm_dbg ("GPS stopped");
@@ -381,9 +390,9 @@ gps_service_state_stop_ready (QmiClientPds *client,
 }
 
 static void
-set_default_tracking_session_stop_ready (QmiClientPds *client,
-                                         GAsyncResult *res,
-                                         GTask        *task)
+pds_set_default_tracking_session_stop_ready (QmiClientPds *client,
+                                             GAsyncResult *res,
+                                             GTask        *task)
 {
     MMSharedQmi                                  *self;
     Private                                      *priv;
@@ -421,9 +430,9 @@ set_default_tracking_session_stop_ready (QmiClientPds *client,
 }
 
 static void
-get_default_tracking_session_stop_ready (QmiClientPds *client,
-                                         GAsyncResult *res,
-                                         GTask        *task)
+pds_get_default_tracking_session_stop_ready (QmiClientPds *client,
+                                             GAsyncResult *res,
+                                             GTask        *task)
 {
     MMSharedQmi                                  *self;
     Private                                      *priv;
@@ -484,13 +493,132 @@ get_default_tracking_session_stop_ready (QmiClientPds *client,
         accuracy_threshold,
         NULL);
     qmi_client_pds_set_default_tracking_session (
-        ctx->client,
+        client,
         input,
         10,
         NULL, /* cancellable */
-        (GAsyncReadyCallback)set_default_tracking_session_stop_ready,
+        (GAsyncReadyCallback)pds_set_default_tracking_session_stop_ready,
         task);
     qmi_message_pds_set_default_tracking_session_input_unref (input);
+}
+
+static void
+pds_disable_location_gathering (GTask *task)
+{
+    MMSharedQmi                     *self;
+    Private                         *priv;
+    DisableLocationGatheringContext *ctx;
+
+    self = g_task_get_source_object (task);
+    priv = get_private (self);
+    ctx  = g_task_get_task_data (task);
+
+    /* Disable A-GPS? */
+    if (ctx->source == MM_MODEM_LOCATION_SOURCE_AGPS) {
+        qmi_client_pds_get_default_tracking_session (
+            QMI_CLIENT_PDS (ctx->client),
+            NULL,
+            10,
+            NULL, /* cancellable */
+            (GAsyncReadyCallback)pds_get_default_tracking_session_stop_ready,
+            task);
+        return;
+    }
+
+    /* Only stop GPS engine if no GPS-related sources enabled */
+    if (ctx->source & (MM_MODEM_LOCATION_SOURCE_GPS_NMEA | MM_MODEM_LOCATION_SOURCE_GPS_RAW)) {
+        MMModemLocationSource tmp;
+
+        /* If no more GPS sources enabled, stop GPS */
+        tmp = priv->enabled_sources;
+        tmp &= ~ctx->source;
+        if (!(tmp & (MM_MODEM_LOCATION_SOURCE_GPS_NMEA | MM_MODEM_LOCATION_SOURCE_GPS_RAW))) {
+            QmiMessagePdsSetGpsServiceStateInput *input;
+
+            input = qmi_message_pds_set_gps_service_state_input_new ();
+            qmi_message_pds_set_gps_service_state_input_set_state (input, FALSE, NULL);
+            qmi_client_pds_set_gps_service_state (
+                QMI_CLIENT_PDS (ctx->client),
+                input,
+                10,
+                NULL, /* cancellable */
+                (GAsyncReadyCallback)pds_gps_service_state_stop_ready,
+                task);
+            qmi_message_pds_set_gps_service_state_input_unref (input);
+            return;
+        }
+
+        /* Otherwise, we have more GPS sources enabled, we shouldn't stop GPS, just
+         * return */
+        priv->enabled_sources &= ~ctx->source;
+        g_task_return_boolean (task, TRUE);
+        g_object_unref (task);
+        return;
+    }
+
+    /* The QMI implementation has a fixed set of capabilities supported. Arriving
+     * here means we tried to disable one which wasn't set as supported, which should
+     * not happen */
+    g_assert_not_reached ();
+}
+
+static void
+loc_stop_ready (QmiClientLoc *client,
+                GAsyncResult *res,
+                GTask        *task)
+{
+    MMSharedQmi                     *self;
+    Private                         *priv;
+    DisableLocationGatheringContext *ctx;
+    QmiMessageLocStopOutput         *output;
+    GError                          *error = NULL;
+
+    output = qmi_client_loc_stop_finish (client, res, &error);
+    if (!output) {
+        g_prefix_error (&error, "QMI operation failed: ");
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+
+    if (!qmi_message_loc_stop_output_get_result (output, &error)) {
+        g_prefix_error (&error, "Couldn't stop GPS engine: ");
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        qmi_message_loc_stop_output_unref (output);
+        return;
+    }
+
+    qmi_message_loc_stop_output_unref (output);
+
+    self = g_task_get_source_object (task);
+    priv = get_private (self);
+    ctx  = g_task_get_task_data (task);
+
+    priv->enabled_sources &= ~ctx->source;
+    g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
+static void
+loc_disable_location_gathering (GTask *task)
+{
+    QmiMessageLocStopInput          *input;
+    DisableLocationGatheringContext *ctx;
+
+    ctx = g_task_get_task_data (task);
+
+    g_assert (ctx->source & (MM_MODEM_LOCATION_SOURCE_GPS_NMEA | MM_MODEM_LOCATION_SOURCE_GPS_RAW));
+
+    input = qmi_message_loc_stop_input_new ();
+    qmi_message_loc_stop_input_set_session_id (input, DEFAULT_LOC_SESSION_ID, NULL);
+    qmi_client_loc_stop (QMI_CLIENT_LOC (ctx->client),
+                         input,
+                         10,
+                         NULL,
+                         (GAsyncReadyCallback) loc_stop_ready,
+                         task);
+    qmi_message_loc_stop_input_unref (input);
 }
 
 void
@@ -512,81 +640,42 @@ mm_shared_qmi_disable_location_gathering (MMIfaceModemLocation  *_self,
     /* NOTE: no parent disable_location_gathering() implementation */
 
     if (!(source & (MM_MODEM_LOCATION_SOURCE_GPS_NMEA |
-                    MM_MODEM_LOCATION_SOURCE_GPS_RAW  |
-                    MM_MODEM_LOCATION_SOURCE_AGPS))) {
+                    MM_MODEM_LOCATION_SOURCE_GPS_RAW))) {
         g_task_return_boolean (task, TRUE);
         g_object_unref (task);
         return;
     }
 
-    if (!priv->pds_client) {
-        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
-                                 "missing QMI PDS client");
-        g_object_unref (task);
-        return;
-    }
+    g_assert (!(priv->pds_client && priv->loc_client));
 
     ctx = g_slice_new0 (DisableLocationGatheringContext);
     ctx->source = source;
-    ctx->client = g_object_ref (priv->pds_client);
     g_task_set_task_data (task, ctx, (GDestroyNotify)disable_location_gathering_context_free);
 
-    /* Disable A-GPS? */
-    if (source == MM_MODEM_LOCATION_SOURCE_AGPS) {
-        qmi_client_pds_get_default_tracking_session (
-            ctx->client,
-            NULL,
-            10,
-            NULL, /* cancellable */
-            (GAsyncReadyCallback)get_default_tracking_session_stop_ready,
-            task);
+    if (priv->pds_client) {
+        ctx->client = g_object_ref (priv->pds_client);
+        pds_disable_location_gathering (task);
         return;
     }
 
-    /* Only stop GPS engine if no GPS-related sources enabled */
-    if (source & (MM_MODEM_LOCATION_SOURCE_GPS_NMEA | MM_MODEM_LOCATION_SOURCE_GPS_RAW)) {
-        MMModemLocationSource tmp;
-
-        /* If no more GPS sources enabled, stop GPS */
-        tmp = priv->enabled_sources;
-        tmp &= ~source;
-        if (!(tmp & (MM_MODEM_LOCATION_SOURCE_GPS_NMEA | MM_MODEM_LOCATION_SOURCE_GPS_RAW))) {
-            QmiMessagePdsSetGpsServiceStateInput *input;
-
-            input = qmi_message_pds_set_gps_service_state_input_new ();
-            qmi_message_pds_set_gps_service_state_input_set_state (input, FALSE, NULL);
-            qmi_client_pds_set_gps_service_state (
-                ctx->client,
-                input,
-                10,
-                NULL, /* cancellable */
-                (GAsyncReadyCallback)gps_service_state_stop_ready,
-                task);
-            qmi_message_pds_set_gps_service_state_input_unref (input);
-            return;
-        }
-
-        /* Otherwise, we have more GPS sources enabled, we shouldn't stop GPS, just
-         * return */
-        priv->enabled_sources &= ~source;
-        g_task_return_boolean (task, TRUE);
-        g_object_unref (task);
+    if (priv->loc_client) {
+        ctx->client = g_object_ref (priv->loc_client);
+        loc_disable_location_gathering (task);
         return;
     }
 
-    /* The QMI implementation has a fixed set of capabilities supported. Arriving
-     * here means we tried to disable one which wasn't set as supported, which should
-     * not happen */
-    g_assert_not_reached ();
+    g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                             "Couldn't find any PDS/LOC client");
+    g_object_unref (task);
 }
 
 /*****************************************************************************/
 /* Location: enable */
 
 static void
-location_event_report_indication_cb (QmiClientPds                      *client,
-                                     QmiIndicationPdsEventReportOutput *output,
-                                     MMSharedQmi                       *self)
+pds_location_event_report_indication_cb (QmiClientPds                      *client,
+                                         QmiIndicationPdsEventReportOutput *output,
+                                         MMSharedQmi                       *self)
 {
     QmiPdsPositionSessionStatus  session_status;
     const gchar                 *nmea;
@@ -608,8 +697,23 @@ location_event_report_indication_cb (QmiClientPds                      *client,
     }
 }
 
+static void
+loc_location_nmea_indication_cb (QmiClientLoc               *client,
+                                 QmiIndicationLocNmeaOutput *output,
+                                 MMSharedQmi                *self)
+{
+    const gchar *nmea = NULL;
+
+    qmi_indication_loc_nmea_output_get_nmea_string (output, &nmea, NULL);
+    if (!nmea)
+        return;
+
+    mm_dbg ("[NMEA] %s", nmea);
+    mm_iface_modem_location_gps_update (MM_IFACE_MODEM_LOCATION (self), nmea);
+}
+
 typedef struct {
-    QmiClientPds          *client;
+    QmiClient             *client;
     MMModemLocationSource  source;
 } EnableLocationGatheringContext;
 
@@ -630,9 +734,9 @@ mm_shared_qmi_enable_location_gathering_finish (MMIfaceModemLocation  *self,
 }
 
 static void
-ser_location_ready (QmiClientPds *client,
-                    GAsyncResult *res,
-                    GTask        *task)
+pds_ser_location_ready (QmiClientPds *client,
+                        GAsyncResult *res,
+                        GTask        *task)
 {
     MMSharedQmi                       *self;
     Private                           *priv;
@@ -664,12 +768,12 @@ ser_location_ready (QmiClientPds *client,
 
     mm_dbg ("Adding location event report indication handling");
     g_assert (!priv->pds_client);
-    g_assert (priv->location_event_report_indication_id == 0);
+    g_assert (priv->pds_location_event_report_indication_id == 0);
     priv->pds_client = g_object_ref (client);
-    priv->location_event_report_indication_id =
+    priv->pds_location_event_report_indication_id =
         g_signal_connect (priv->pds_client,
                           "event-report",
-                          G_CALLBACK (location_event_report_indication_cb),
+                          G_CALLBACK (pds_location_event_report_indication_cb),
                           self);
 
     mm_dbg ("GPS started");
@@ -679,9 +783,9 @@ ser_location_ready (QmiClientPds *client,
 }
 
 static void
-auto_tracking_state_start_ready (QmiClientPds *client,
-                                 GAsyncResult *res,
-                                 GTask        *task)
+pds_auto_tracking_state_start_ready (QmiClientPds *client,
+                                     GAsyncResult *res,
+                                     GTask        *task)
 {
     QmiMessagePdsSetEventReportInput        *input;
     QmiMessagePdsSetAutoTrackingStateOutput *output = NULL;
@@ -718,15 +822,15 @@ auto_tracking_state_start_ready (QmiClientPds *client,
         input,
         5,
         NULL,
-        (GAsyncReadyCallback)ser_location_ready,
+        (GAsyncReadyCallback)pds_ser_location_ready,
         task);
     qmi_message_pds_set_event_report_input_unref (input);
 }
 
 static void
-gps_service_state_start_ready (QmiClientPds *client,
-                               GAsyncResult *res,
-                               GTask        *task)
+pds_gps_service_state_start_ready (QmiClientPds *client,
+                                   GAsyncResult *res,
+                                   GTask        *task)
 {
     QmiMessagePdsSetAutoTrackingStateInput *input;
     QmiMessagePdsSetGpsServiceStateOutput  *output;
@@ -763,15 +867,15 @@ gps_service_state_start_ready (QmiClientPds *client,
         input,
         10,
         NULL, /* cancellable */
-        (GAsyncReadyCallback)auto_tracking_state_start_ready,
+        (GAsyncReadyCallback)pds_auto_tracking_state_start_ready,
         task);
     qmi_message_pds_set_auto_tracking_state_input_unref (input);
 }
 
 static void
-set_default_tracking_session_start_ready (QmiClientPds *client,
-                                          GAsyncResult *res,
-                                          GTask        *task)
+pds_set_default_tracking_session_start_ready (QmiClientPds *client,
+                                              GAsyncResult *res,
+                                              GTask        *task)
 {
     MMSharedQmi                                  *self;
     Private                                      *priv;
@@ -809,9 +913,9 @@ set_default_tracking_session_start_ready (QmiClientPds *client,
 }
 
 static void
-get_default_tracking_session_start_ready (QmiClientPds *client,
-                                          GAsyncResult *res,
-                                          GTask        *task)
+pds_get_default_tracking_session_start_ready (QmiClientPds *client,
+                                              GAsyncResult *res,
+                                              GTask        *task)
 {
     MMSharedQmi                                  *self;
     Private                                      *priv;
@@ -871,13 +975,182 @@ get_default_tracking_session_start_ready (QmiClientPds *client,
         accuracy_threshold,
         NULL);
     qmi_client_pds_set_default_tracking_session (
-        ctx->client,
+        client,
         input,
         10,
         NULL, /* cancellable */
-        (GAsyncReadyCallback)set_default_tracking_session_start_ready,
+        (GAsyncReadyCallback)pds_set_default_tracking_session_start_ready,
         task);
     qmi_message_pds_set_default_tracking_session_input_unref (input);
+}
+
+static void
+pds_enable_location_gathering (GTask *task)
+{
+    MMSharedQmi                    *self;
+    Private                        *priv;
+    EnableLocationGatheringContext *ctx;
+
+    self = g_task_get_source_object (task);
+    priv = get_private (self);
+    ctx  = g_task_get_task_data (task);
+
+    /* Enabling A-GPS? */
+    if (ctx->source == MM_MODEM_LOCATION_SOURCE_AGPS) {
+        qmi_client_pds_get_default_tracking_session (
+            QMI_CLIENT_PDS (ctx->client),
+            NULL,
+            10,
+            NULL, /* cancellable */
+            (GAsyncReadyCallback)pds_get_default_tracking_session_start_ready,
+            task);
+        return;
+    }
+
+    /* NMEA and RAW are both enabled in the same way */
+    if (ctx->source & (MM_MODEM_LOCATION_SOURCE_GPS_NMEA | MM_MODEM_LOCATION_SOURCE_GPS_RAW)) {
+        /* Only start GPS engine if not done already */
+        if (!(priv->enabled_sources & (MM_MODEM_LOCATION_SOURCE_GPS_NMEA | MM_MODEM_LOCATION_SOURCE_GPS_RAW))) {
+            QmiMessagePdsSetGpsServiceStateInput *input;
+
+            input = qmi_message_pds_set_gps_service_state_input_new ();
+            qmi_message_pds_set_gps_service_state_input_set_state (input, TRUE, NULL);
+            qmi_client_pds_set_gps_service_state (
+                QMI_CLIENT_PDS (ctx->client),
+                input,
+                10,
+                NULL, /* cancellable */
+                (GAsyncReadyCallback)pds_gps_service_state_start_ready,
+                task);
+            qmi_message_pds_set_gps_service_state_input_unref (input);
+            return;
+        }
+
+        /* GPS already started, we're done */
+        priv->enabled_sources |= ctx->source;
+        g_task_return_boolean (task, TRUE);
+        g_object_unref (task);
+        return;
+    }
+
+    /* The PDS QMI implementation has a fixed set of capabilities supported. Arriving
+     * here means we tried to enable one which wasn't set as supported, which should
+     * not happen */
+    g_assert_not_reached ();
+}
+
+static void
+loc_register_events_ready (QmiClientLoc *client,
+                           GAsyncResult *res,
+                           GTask        *task)
+{
+    MMSharedQmi                       *self;
+    Private                           *priv;
+    EnableLocationGatheringContext    *ctx;
+    QmiMessageLocRegisterEventsOutput *output;
+    GError                            *error = NULL;
+
+   output = qmi_client_loc_register_events_finish (client, res, &error);
+   if (!output) {
+        g_prefix_error (&error, "QMI operation failed: ");
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+   }
+
+    if (!qmi_message_loc_register_events_output_get_result (output, &error)) {
+        g_prefix_error (&error, "Couldn't not register tracking events: ");
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        qmi_message_loc_register_events_output_unref (output);
+        return;
+    }
+
+    qmi_message_loc_register_events_output_unref (output);
+
+    self = g_task_get_source_object (task);
+    priv = get_private (self);
+    ctx  = g_task_get_task_data (task);
+
+    mm_dbg ("Adding NMEA indication handling");
+    g_assert (!priv->loc_client);
+    g_assert (!priv->loc_location_nmea_indication_id);
+    priv->loc_client = g_object_ref (client);
+    priv->loc_location_nmea_indication_id =
+        g_signal_connect (ctx->client,
+                          "nmea",
+                          G_CALLBACK (loc_location_nmea_indication_cb),
+                          self);
+
+    mm_dbg ("GPS started");
+    priv->enabled_sources |= ctx->source;
+    g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
+static void
+loc_start_ready (QmiClientLoc *client,
+                 GAsyncResult *res,
+                 GTask        *task)
+{
+    QmiMessageLocRegisterEventsInput *input;
+    QmiMessageLocStartOutput         *output;
+    GError                           *error = NULL;
+
+    output = qmi_client_loc_start_finish (client, res, &error);
+    if (!output) {
+        g_prefix_error (&error, "QMI operation failed: ");
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+
+    if (!qmi_message_loc_start_output_get_result (output, &error)) {
+        g_prefix_error (&error, "Couldn't start GPS engine: ");
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        qmi_message_loc_start_output_unref (output);
+        return;
+    }
+
+    qmi_message_loc_start_output_unref (output);
+
+    input = qmi_message_loc_register_events_input_new ();
+    qmi_message_loc_register_events_input_set_event_registration_mask (
+        input, QMI_LOC_EVENT_REGISTRATION_FLAG_NMEA, NULL);
+    qmi_client_loc_register_events (client,
+                                    input,
+                                    10,
+                                    NULL,
+                                    (GAsyncReadyCallback) loc_register_events_ready,
+                                    task);
+    qmi_message_loc_register_events_input_unref (input);
+}
+
+static void
+loc_enable_location_gathering (GTask *task)
+{
+    QmiMessageLocStartInput        *input;
+    MMSharedQmi                    *self;
+    Private                        *priv;
+    EnableLocationGatheringContext *ctx;
+
+    self = g_task_get_source_object (task);
+    priv = get_private (self);
+    ctx  = g_task_get_task_data (task);
+
+    input = qmi_message_loc_start_input_new ();
+    qmi_message_loc_start_input_set_session_id (input, DEFAULT_LOC_SESSION_ID, NULL);
+    qmi_message_loc_start_input_set_intermediate_report_state (input, QMI_LOC_INTERMEDIATE_REPORT_STATE_DISABLE, NULL);
+    qmi_message_loc_start_input_set_minimum_interval_between_position_reports (input, 5000, NULL);
+    qmi_message_loc_start_input_set_fix_recurrence_type (input, QMI_LOC_FIX_RECURRENCE_TYPE_REQUEST_PERIODIC_FIXES, NULL);
+    qmi_client_loc_start (QMI_CLIENT_LOC (ctx->client),
+                          input,
+                          10,
+                          NULL,
+                          (GAsyncReadyCallback) loc_start_ready,
+                          task);
+    qmi_message_loc_start_input_unref (input);
 }
 
 static void
@@ -912,60 +1185,31 @@ parent_enable_location_gathering_ready (MMIfaceModemLocation *_self,
         return;
     }
 
-    /* Setup context and client */
+    /* Prefer PDS */
     client = mm_shared_qmi_peek_client (MM_SHARED_QMI (self),
                                         QMI_SERVICE_PDS,
                                         MM_PORT_QMI_FLAG_DEFAULT,
-                                        &error);
-    if (!client) {
-        g_task_return_error (task, error);
-        g_object_unref (task);
-        return;
-    }
-    ctx->client = g_object_ref (client);
-
-    /* Enabling A-GPS? */
-    if (ctx->source == MM_MODEM_LOCATION_SOURCE_AGPS) {
-        qmi_client_pds_get_default_tracking_session (
-            ctx->client,
-            NULL,
-            10,
-            NULL, /* cancellable */
-            (GAsyncReadyCallback)get_default_tracking_session_start_ready,
-            task);
+                                        NULL);
+    if (client) {
+        ctx->client = g_object_ref (client);
+        pds_enable_location_gathering (task);
         return;
     }
 
-    /* NMEA and RAW are both enabled in the same way */
-    if (ctx->source & (MM_MODEM_LOCATION_SOURCE_GPS_NMEA | MM_MODEM_LOCATION_SOURCE_GPS_RAW)) {
-        /* Only start GPS engine if not done already */
-        if (!(priv->enabled_sources & (MM_MODEM_LOCATION_SOURCE_GPS_NMEA | MM_MODEM_LOCATION_SOURCE_GPS_RAW))) {
-            QmiMessagePdsSetGpsServiceStateInput *input;
-
-            input = qmi_message_pds_set_gps_service_state_input_new ();
-            qmi_message_pds_set_gps_service_state_input_set_state (input, TRUE, NULL);
-            qmi_client_pds_set_gps_service_state (
-                ctx->client,
-                input,
-                10,
-                NULL, /* cancellable */
-                (GAsyncReadyCallback)gps_service_state_start_ready,
-                task);
-            qmi_message_pds_set_gps_service_state_input_unref (input);
-            return;
-        }
-
-        /* GPS already started, we're done */
-        priv->enabled_sources |= ctx->source;
-        g_task_return_boolean (task, TRUE);
-        g_object_unref (task);
+    /* Otherwise LOC */
+    client = mm_shared_qmi_peek_client (MM_SHARED_QMI (self),
+                                        QMI_SERVICE_LOC,
+                                        MM_PORT_QMI_FLAG_DEFAULT,
+                                        NULL);
+    if (client) {
+        ctx->client = g_object_ref (client);
+        loc_enable_location_gathering (task);
         return;
     }
 
-    /* The shared QMI implementation has a fixed set of capabilities supported. Arriving
-     * here means we tried to enable one which wasn't set as supported, which should
-     * not happen */
-    g_assert_not_reached ();
+    g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                             "Couldn't find any PDS/LOC client");
+    g_object_unref (task);
 }
 
 void
@@ -1036,6 +1280,11 @@ parent_load_capabilities_ready (MMIfaceModemLocation *self,
         sources |= (MM_MODEM_LOCATION_SOURCE_GPS_NMEA |
                     MM_MODEM_LOCATION_SOURCE_GPS_RAW |
                     MM_MODEM_LOCATION_SOURCE_AGPS);
+
+    /* If we have support for the LOC client, GPS location is supported */
+    if (mm_shared_qmi_peek_client (MM_SHARED_QMI (self), QMI_SERVICE_LOC, MM_PORT_QMI_FLAG_DEFAULT, NULL))
+        sources |= (MM_MODEM_LOCATION_SOURCE_GPS_NMEA |
+                    MM_MODEM_LOCATION_SOURCE_GPS_RAW);
 
     /* So we're done, complete */
     g_task_return_int (task, sources);
