@@ -1073,6 +1073,22 @@ port_connected (MMPortSerial *self, GParamSpec *pspec, gpointer user_data)
          * again.
          */
 
+        if(!connected) {
+            int locking_status = 0;
+
+            if (ioctl (self->priv->fd, TIOCGEXCL, &locking_status) < 0 && errno != EINVAL && errno != ENOTTY) {
+                errno_save = errno;
+                mm_warn ("(%s): when trying to re-acquire serial device, could not check locking status using tty_ioctl(4) (%d)", mm_port_get_device (MM_PORT (self)), errno_save);
+                goto error;
+            }
+
+            if (locking_status != 0) {
+                errno_save = errno;
+                mm_warn ("(%s): when trying to re-acquire serial device, it has been locked using tty_ioctl(4) in meantime", mm_port_get_device (MM_PORT (self)));
+                goto error;
+            }
+        }
+
         if (ioctl (self->priv->fd, (connected ? TIOCNXCL : TIOCEXCL)) < 0) {
             errno_save = errno;
             mm_warn ("(%s): could not %s the tty_ioctl(4) serial port lock: (%d) %s",
