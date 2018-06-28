@@ -1117,10 +1117,9 @@ port_connected (MMPortSerial *self, GParamSpec *pspec, gpointer user_data)
     return;
 
 error:
-    if (!connected) {
-        // FIXME: do something here, maybe try again in a few seconds or
-        // close the port and error out?
-    }
+    // FIXME: before closing the port, maybe try again in a few seconds?
+
+    mm_port_serial_close (self);
 }
 
 gboolean
@@ -1408,8 +1407,6 @@ _close_internal (MMPortSerial *self, gboolean force)
 
         mm_dbg ("(%s) closing serial port...", device);
 
-        mm_port_set_connected (MM_PORT (self), FALSE);
-
         g_get_current_time (&tv_start);
 
         /* Serial port specific setup */
@@ -1429,12 +1426,21 @@ _close_internal (MMPortSerial *self, gboolean force)
 
             tcflush (self->priv->fd, TCIOFLUSH);
 
-            /* Remove the possibly set tty_ioctl(4) lock */
-            if (ioctl (self->priv->fd, TIOCNXCL) < 0) {
-                errno_save = errno;
-                mm_warn ("(%s) could not unlock serial device using tty_ioctl(4) (%d)", device, errno_save);
+            /* Remove the tty_ioctl(4) lock, when set (it is acquired by
+             * us when the port is not in connected state, otherwise it was
+             * already released so that PPP could acquire it)
+             */
+            if (!mm_port_get_connected (MM_PORT (self))) {
+
+                if (ioctl (self->priv->fd, TIOCNXCL) < 0) {
+                    errno_save = errno;
+                    mm_warn ("(%s) could not unlock serial device using tty_ioctl(4) (%d)", device, errno_save);
+                }
+
             }
         }
+
+        mm_port_set_connected (MM_PORT (self), FALSE);
 
         /* Destroy channel */
         if (self->priv->iochannel) {
