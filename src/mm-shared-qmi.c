@@ -595,6 +595,13 @@ loc_stop_ready (QmiClientLoc *client,
     priv = get_private (self);
     ctx  = g_task_get_task_data (task);
 
+    g_assert (priv->loc_location_nmea_indication_id != 0);
+    g_assert (priv->loc_client);
+
+    g_signal_handler_disconnect (priv->loc_client, priv->loc_location_nmea_indication_id);
+    priv->loc_location_nmea_indication_id = 0;
+    g_clear_object (&priv->loc_client);
+
     priv->enabled_sources &= ~ctx->source;
     g_task_return_boolean (task, TRUE);
     g_object_unref (task);
@@ -1130,7 +1137,6 @@ loc_start_ready (QmiClientLoc *client,
 static void
 loc_enable_location_gathering (GTask *task)
 {
-    QmiMessageLocStartInput        *input;
     MMSharedQmi                    *self;
     Private                        *priv;
     EnableLocationGatheringContext *ctx;
@@ -1139,18 +1145,38 @@ loc_enable_location_gathering (GTask *task)
     priv = get_private (self);
     ctx  = g_task_get_task_data (task);
 
-    input = qmi_message_loc_start_input_new ();
-    qmi_message_loc_start_input_set_session_id (input, DEFAULT_LOC_SESSION_ID, NULL);
-    qmi_message_loc_start_input_set_intermediate_report_state (input, QMI_LOC_INTERMEDIATE_REPORT_STATE_DISABLE, NULL);
-    qmi_message_loc_start_input_set_minimum_interval_between_position_reports (input, 5000, NULL);
-    qmi_message_loc_start_input_set_fix_recurrence_type (input, QMI_LOC_FIX_RECURRENCE_TYPE_REQUEST_PERIODIC_FIXES, NULL);
-    qmi_client_loc_start (QMI_CLIENT_LOC (ctx->client),
-                          input,
-                          10,
-                          NULL,
-                          (GAsyncReadyCallback) loc_start_ready,
-                          task);
-    qmi_message_loc_start_input_unref (input);
+    /* NMEA and RAW are both enabled in the same way */
+    if (ctx->source & (MM_MODEM_LOCATION_SOURCE_GPS_NMEA | MM_MODEM_LOCATION_SOURCE_GPS_RAW)) {
+        /* Only start GPS engine if not done already */
+        if (!(priv->enabled_sources & (MM_MODEM_LOCATION_SOURCE_GPS_NMEA | MM_MODEM_LOCATION_SOURCE_GPS_RAW))) {
+            QmiMessageLocStartInput *input;
+
+            input = qmi_message_loc_start_input_new ();
+            qmi_message_loc_start_input_set_session_id (input, DEFAULT_LOC_SESSION_ID, NULL);
+            qmi_message_loc_start_input_set_intermediate_report_state (input, QMI_LOC_INTERMEDIATE_REPORT_STATE_DISABLE, NULL);
+            qmi_message_loc_start_input_set_minimum_interval_between_position_reports (input, 5000, NULL);
+            qmi_message_loc_start_input_set_fix_recurrence_type (input, QMI_LOC_FIX_RECURRENCE_TYPE_REQUEST_PERIODIC_FIXES, NULL);
+            qmi_client_loc_start (QMI_CLIENT_LOC (ctx->client),
+                                  input,
+                                  10,
+                                  NULL,
+                                  (GAsyncReadyCallback) loc_start_ready,
+                                  task);
+            qmi_message_loc_start_input_unref (input);
+            return;
+        }
+
+        /* GPS already started, we're done */
+        priv->enabled_sources |= ctx->source;
+        g_task_return_boolean (task, TRUE);
+        g_object_unref (task);
+        return;
+    }
+
+    /* The LOC QMI implementation has a fixed set of capabilities supported. Arriving
+     * here means we tried to enable one which wasn't set as supported, which should
+     * not happen */
+    g_assert_not_reached ();
 }
 
 static void
