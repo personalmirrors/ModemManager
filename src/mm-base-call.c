@@ -696,14 +696,16 @@ mm_base_call_change_state (MMBaseCall        *self,
 
     /* Setup/cleanup unsolicited events  based on state transitions to/from ACTIVE */
     if (!MM_CALL_STATE_IS_IN_CALL (old_state) && MM_CALL_STATE_IS_IN_CALL (new_state)) {
+        mm_dbg ("Setting up in-call unsolicited events...");
         if (MM_BASE_CALL_GET_CLASS (self)->setup_unsolicited_events &&
             !MM_BASE_CALL_GET_CLASS (self)->setup_unsolicited_events (self, &error)) {
             mm_warn ("Couldn't setup in-call unsolicited events: %s", error->message);
             g_error_free (error);
         }
     } else if (MM_CALL_STATE_IS_IN_CALL (old_state) && !MM_CALL_STATE_IS_IN_CALL (new_state)) {
+        mm_dbg ("Cleaning up in-call unsolicited events...");
         if (MM_BASE_CALL_GET_CLASS (self)->cleanup_unsolicited_events &&
-            !MM_BASE_CALL_GET_CLASS (self)->setup_unsolicited_events (self, &error)) {
+            !MM_BASE_CALL_GET_CLASS (self)->cleanup_unsolicited_events (self, &error)) {
             mm_warn ("Couldn't cleanup in-call unsolicited events: %s", error->message);
             g_error_free (error);
         }
